@@ -133,6 +133,7 @@ jobs:
       contents: write
     env:
       TAG: ${{ inputs.release_tag }}
+      REPO: ${{ github.repository }}
     steps:
       - name: Collect artifacts
         uses: actions/download-artifact@v4
@@ -154,8 +155,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" out/* --clobber
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber --repo "$REPO"
           else
-            gh release create "$TAG" out/* --generate-notes --title "$TAG" --target "$GITHUB_SHA"
+            gh release create "$TAG" out/* \
+              --generate-notes --title "$TAG" --target "$GITHUB_SHA" --repo "$REPO"
           fi
