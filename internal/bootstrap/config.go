@@ -54,6 +54,14 @@ type ProviderConfig struct {
 	APIKey  string        `json:"api_key,omitempty"`  // API Key
 	BaseURL string        `json:"base_url,omitempty"` // API Base URL
 	Models  []ModelConfig `json:"models,omitempty"`   // 可选模型列表，供 TUI 切换时展示
+	// PromptCache 三态声明是否携带提示词缓存提示（OpenAI 系 prompt_cache_key
+	// 路由亲和 + Claude 系 cache_control 末消息断点）。
+	// 未配置 = 沿用默认：照常带上，由 litellm 按端点能力声明门控，第三方端点
+	// 默认不发（docs/prompt-cache-design.md §7）。
+	// false = 完全不发，给"把 cache_control 原样透传给上游、上游模型直接 400"
+	// 的中转站留逃生口——这类 400 是确定性的，重试和失败仲裁都救不回来。
+	// true = 显式声明该端点接受这些字段（跨过能力门控的断言）。
+	PromptCache *bool `json:"prompt_cache,omitempty"`
 	// ExtraBody 透传给该 provider 每次请求的额外参数（如 temperature/top_p/min_p/
 	// presence_penalty，或厂商特有键如 nvidia 开 think 的 chat_template_kwargs）。
 	// OpenAI 兼容端逐字并入请求体（即 extra_body 约定）；值由用户自负其责。
@@ -118,6 +126,15 @@ func (c Config) ModelJSONSchema(provider, model string) *bool {
 		}
 	}
 	return nil
+}
+
+// ProviderPromptCacheOff 报告该 provider 是否被显式声明为"不带提示词缓存提示"。
+// 未配置（nil）= 沿用默认（照常带上，由 litellm 按端点能力门控）；
+// 只有显式 false 才返回 true——true 同样视为"照常带上"，因为能力门控在上游
+// 已经把端点判定纳入考量，应用层再反向覆盖只会绕开那道门。
+func (c Config) ProviderPromptCacheOff(provider string) bool {
+	pc, ok := c.Providers[provider]
+	return ok && pc.PromptCache != nil && !*pc.PromptCache
 }
 
 // defaultStreamIdleTimeout：长输出 + 长 ctx 场景下，reasoning-aware provider

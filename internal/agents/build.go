@@ -38,6 +38,31 @@ func promptCacheBase(bookDir string) string {
 	return "nvl-" + hex.EncodeToString(sum[:6])
 }
 
+// cacheHints 是单个 Worker 的提示词缓存提示，对应 subagent.Config 的两个可选字段。
+// 两个字段都是空值即"不带任何缓存提示"——零值就是安全的退化路径。
+type cacheHints struct {
+	lastMessage string // CacheLastMessage：末消息 cache_control 断点，空=不打
+	key         string // PromptCacheKey：OpenAI 系路由亲和键，空=不带
+}
+
+// resolveCacheHints 按角色当前选中的 provider 决定是否携带缓存提示。
+//
+// role 是角色名（architect/writer/editor），cacheKey 由调用方拼好完整身份
+// （architect 的两个子代理各有各的键，与"一角色一名"的历史键保持一致，
+// 避免升级后缓存血统断裂）。provider 未显式 "prompt_cache": false 时一律照常
+// 带上，由下游能力门控决定发不发。
+func resolveCacheHints(cfg bootstrap.Config, models *bootstrap.ModelSet, role, cacheKey string) cacheHints {
+	hints := cacheHints{lastMessage: "ephemeral", key: cacheKey}
+	if models == nil {
+		return hints
+	}
+	provider, _, _ := models.CurrentSelection(role)
+	if cfg.ProviderPromptCacheOff(provider) {
+		return cacheHints{}
+	}
+	return hints
+}
+
 // subagentMaxRetries 是所有 Worker 的 LLM retry 上限。
 // 退避策略：指数退避（受 maxDelay 上限约束），优先服从 server Retry-After。
 // 工具只在完整 Assistant 消息提交后启动，因此 stream-idle / 503 /
@@ -192,9 +217,18 @@ func BuildWorkers(
 
 	// 提示词缓存：一书一基、一角色一名、一会话一键（subagent spawn 追加 #seq）。
 	// OpenAI 系用 prompt_cache_key 做路由亲和；Claude 系用 cache_control 滚动断点
-	//（system 地板 + 末消息尖端）。provider 不支持时由 agentcore 按能力静默丢弃，
-	// 多轮会话下读缓存收益恒为正，故不设开关。
+	//（system 地板 + 末消息尖端）。默认两个字段都交给 agentcore，由 litellm 按端点
+	// 能力声明门控，第三方 OpenAI 兼容端默认不发 prompt_cache_key
+	//（docs/prompt-cache-design.md §7）；多轮会话下读缓存收益恒为正。
+	//
+	// 例外：provider 显式 "prompt_cache": false 时两个字段都不带。给那些把
+	// cache_control 原样透传给上游、上游模型对断点直接 400 的中转站留逃生口——
+	// 这类 400 是确定性的，重试和失败仲裁都救不回来，只能由配置关掉。
 	cacheBase := promptCacheBase(store.Dir())
+	architectShortCache := resolveCacheHints(cfg, models, "architect", cacheBase+"-architect_short")
+	architectLongCache := resolveCacheHints(cfg, models, "architect", cacheBase+"-architect_long")
+	writerCache := resolveCacheHints(cfg, models, "writer", cacheBase+"-writer")
+	editorCache := resolveCacheHints(cfg, models, "editor", cacheBase+"-editor")
 
 	architectStopGuardFactory := func(_, _ string) agentcore.StopGuard {
 		return guard.NewArchitectStopGuard(store, onGuardBlock)
@@ -217,8 +251,8 @@ func BuildWorkers(
 		MaxRetries:            subagentMaxRetries,
 		ThinkingLevel:         architectThinking,
 		OnMessage:             onMsg,
-		CacheLastMessage:      "ephemeral",
-		PromptCacheKey:        cacheBase + "-architect_short",
+		CacheLastMessage:      architectShortCache.lastMessage,
+		PromptCacheKey:        architectShortCache.key,
 		ContextManagerFactory: roleContextFactory(architectContextProfile),
 		StopAfterToolResult: func(toolName string, result json.RawMessage) bool {
 			return foundationReadyResult(toolName, result)
@@ -235,8 +269,8 @@ func BuildWorkers(
 		MaxRetries:            subagentMaxRetries,
 		ThinkingLevel:         architectThinking,
 		OnMessage:             onMsg,
-		CacheLastMessage:      "ephemeral",
-		PromptCacheKey:        cacheBase + "-architect_long",
+		CacheLastMessage:      architectLongCache.lastMessage,
+		PromptCacheKey:        architectLongCache.key,
 		ContextManagerFactory: roleContextFactory(architectContextProfile),
 		StopAfterToolResult:   architectLongShouldStopAfterToolResult,
 		StopGuardFactory:      architectStopGuardFactory,
@@ -260,8 +294,8 @@ func BuildWorkers(
 		ThinkingLevel:    resolvedRoleThinking(writerModel, cfg, "writer"),
 		StopAfterTools:   []string{"commit_chapter"},
 		OnMessage:        onMsg,
-		CacheLastMessage: "ephemeral",
-		PromptCacheKey:   cacheBase + "-writer",
+		CacheLastMessage: writerCache.lastMessage,
+		PromptCacheKey:   writerCache.key,
 		StopGuardFactory: func(_, _ string) agentcore.StopGuard {
 			return guard.NewWriterStopGuard(store, onGuardBlock)
 		},
@@ -305,8 +339,8 @@ func BuildWorkers(
 		MaxRetries:            subagentMaxRetries,
 		ThinkingLevel:         resolvedRoleThinking(editorModel, cfg, "editor"),
 		OnMessage:             onMsg,
-		CacheLastMessage:      "ephemeral",
-		PromptCacheKey:        cacheBase + "-editor",
+		CacheLastMessage:      editorCache.lastMessage,
+		PromptCacheKey:        editorCache.key,
 		ContextManagerFactory: roleContextFactory(editorContextProfile),
 		// 终态产物命中即停。终态退出仍会咨询 StopGuard（契约测试 TestContract_
 		// TerminalToolExitConsultsStopGuard），任务感知的 NewEditorStopGuard 负责

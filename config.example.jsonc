@@ -81,6 +81,13 @@
       // 可选。OpenAI 协议 endpoint：chat（默认 /v1/chat/completions）/
       // responses（/v1/responses）。Codex 类代理通常需要 responses。
       "api": "responses",
+      // 可选。是否携带提示词缓存提示（prompt_cache_key 路由亲和 + 末消息
+      // cache_control 断点）。省略 = 默认带上，由 litellm 按端点能力门控，
+      // 第三方 OpenAI 兼容端默认不发 prompt_cache_key（见下方 extra 同名项）。
+      // false = 完全不发：中转把 cache_control 原样透传给上游、上游模型对断点
+      // 直接 400 时用这个。症状是请求一上来就被拒、报"确定性参数校验失败"，
+      // 重试和失败裁定都救不回来，只能由配置关掉。
+      // "prompt_cache": false,
       "extra": {
         // 可选。缓存路由键 prompt_cache_key 默认只发给官方 api.openai.com——
         // 第三方兼容端对未知字段没有统一契约（Groq/Cerebras/火山等严格端会 400，

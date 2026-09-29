@@ -348,6 +348,42 @@ func isOfficialBaseURL(baseURL string) bool {
 > 为什么开关做在 litellm 能力层而不是应用配置层？因为运行时 `/model` 切 provider
 > 会换 client，能力声明跟着 client 自动切换；应用构造期的判定覆盖不了运行时切换。
 
+### 7.3 断点路径没有同等门控（已观测）+ 应用层逃生口
+
+§7.1 展示的门控只覆盖了 `prompt_cache_key`（`caps.Cache.PromptKey`）。**断点那条路
+（`CacheLastMessage: "ephemeral"` → 末消息 `cache_control`）没有对等的能力门控**，
+而 `internal/agents/build.go` 对四个 Worker 是无条件设置这两个字段的。
+
+真实故障（第三方 OpenAI 兼容中转 + 非官方 base_url）：请求一上来就被上游按
+"不支持的参数"拒绝。症状具有欺骗性——它不是网络抖动也不是限流，而是**确定性
+的 400**：`errorKind()` 没有对应分类（见 `internal/host/observer.go`），落到
+`error_kind="unknown"`，于是失败仲裁把它当"未知错误"，只能给出一段
+"重试无效、请人工修正配置"的散文式裁定，既不指出是哪个字段，也不给出改法。
+
+根因是 OpenAI 系**根本不存在** `cache_control` 断点这种缓存协议（§2.1：隐式
+前缀缓存，客户端无需声明）。给 OpenAI 格式端点打断点，语义上就是发送了该协议
+不认识的字段；宽松端忽略，严格端 400。
+
+因此在应用层补一个逃生口：provider 级 `"prompt_cache": false` 让该 provider 的
+两个缓存字段同时归零。
+
+```jsonc
+"my-relay": {
+  "type": "openai",
+  "base_url": "https://relay.example.com/v1",
+  "prompt_cache": false   // 这个中转会把 cache_control 透传给上游并被拒
+}
+```
+
+设计取舍：**只认显式 `false`**，省略和 `true` 都维持"照常带上"。理由有二——
+一是保持默认行为零变化（§7.2 的"默认永不炸任何端点"不因这次修复而松动）；
+二是 `true` 若在应用层强行置位，会绕开 litellm 那道按端点判定的能力门控，
+等于把一个跨仓库的判定复制进应用层，正是 §7.2 末尾反对的做法。
+
+> 根治仍应在 litellm：给断点路径补一条与 `Cache.PromptKey` 对等的能力门控，
+> 并让 OpenAI provider 显式声明"不支持显式断点"。本节的开关是在那之前
+> 让用户能自己走出来的门，不是替 litellm 做决定。
+
 ---
 
 ## 8. 观测：缓存链断裂检测
