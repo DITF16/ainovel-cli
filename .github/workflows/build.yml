@@ -1,0 +1,156 @@
+name: Build Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "同时发布到 GitHub Release（需在 v* tag 上手动触发）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  BINARY: ainovel-cli
+
+jobs:
+  build:
+    name: ${{ matrix.os }}-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+          - os: linux
+            arch: arm64
+          - os: windows
+            arch: amd64
+          - os: windows
+            arch: arm64
+          - os: darwin
+            arch: amd64
+          - os: darwin
+            arch: arm64
+
+    runs-on: ubuntu-latest
+    env:
+      GOOS: ${{ matrix.os }}
+      GOARCH: ${{ matrix.arch }}
+      CGO_ENABLED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          name="$BINARY"
+          if [ "$GOOS" = "windows" ]; then
+            name="$BINARY.exe"
+          fi
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w \
+              -X main.version=$VERSION \
+              -X main.commit=$(git rev-parse --short HEAD) \
+              -X main.date=$(git log -1 --format=%cI)" \
+            -o "dist/$name" ./cmd/ainovel-cli
+
+      - name: Smoke test
+        if: ${{ matrix.os == 'linux' && matrix.arch == 'amd64' }}
+        run: ./dist/ainovel-cli --version
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$GOOS" in
+            linux)   OS=Linux   ;;
+            windows) OS=Windows ;;
+            darwin)  OS=Darwin  ;;
+            *) echo "unsupported GOOS: $GOOS" >&2; exit 1 ;;
+          esac
+          if [ "$GOARCH" = "amd64" ]; then
+            ARCH=x86_64
+          else
+            ARCH="$GOARCH"
+          fi
+          name="$BINARY"
+          if [ "$GOOS" = "windows" ]; then
+            name="$BINARY.exe"
+          fi
+          archive="${BINARY}_${VERSION}_${OS}_${ARCH}"
+
+          cp README.md LICENSE dist/
+          mkdir -p out
+          if [ "$GOOS" = "windows" ]; then
+            (cd dist && zip -q "../out/${archive}.zip" "$name" README.md LICENSE)
+          else
+            (cd dist && tar -czf "../out/${archive}.tar.gz" "$name" README.md LICENSE)
+          fi
+          sha256sum "out/${archive}".* | sed "s|out/||" > "out/${archive}.sha256"
+          ls -l out/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ainovel-cli-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/ainovel-cli_*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    if: ${{ inputs.publish_release && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ainovel-cli-*
+          path: out
+          merge-multiple: true
+
+      - name: Merge checksums
+        run: |
+          set -euo pipefail
+          cd out
+          cat ./*.sha256 | sort -k2 > ainovel-cli_checksums.txt
+          rm ./*.sha256
+          cat ainovel-cli_checksums.txt
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* --generate-notes --title "$TAG"
+          fi
